@@ -65,5 +65,3 @@ SSTtechnitum is the team behind this repository, which holds the engineering mat
 - Bot is positioned straight on the start line.
 
 ---
-
-**BEST OF LUCK!!!**
