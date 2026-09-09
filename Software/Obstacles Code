@@ -1,339 +1,1279 @@
 #include <Evo.h>
 #include <ESP32Servo.h>
+//Non Obstacle Round
 
-// =====================================================================
-//   START
-//     -> Store Current Heading (heading0)
-//     -> Go Forward
-//     -> Detect Orange or Blue?
-//          YES(orange) -> Save Direction = Right -> Always Turn Right
-//          YES(blue)   -> Save Direction = Left  -> Always Turn Left
-//          NO -> Current heading different from original heading?
-//                  YES -> Steer proportionally to (current - original)
-//                  NO  -> Right/Left ToF sense wall?
-//                           NO  -> Turn toward the side NOT sensing a wall
-//                                  (or the locked color direction, if set)
-//                           YES -> loop back to "Go Forward" (drive straight)
-//
-// Every branch that performs a TURN (color turn or wall-opening turn) or a
-// STEERING CORRECTION re-stores heading0 before the next loop() call, which
-// mirrors the diagram's arrows looping back into "Store Current Heading".
-// The "walls sensed on both sides" branch loops back only to "Go Forward"
-// =====================================================================
+
+
+
+// ============================================================
+// HARDWARE OBJECTS
+// ============================================================
+
+
+
 
 EVOX1 evo;
-
-// --- IMU ---
 EvoIMU gyro(I2C8);
-
-// --- Servo ---
 Servo steering;
 
-// --- TOF sensors ---
+
+
+
 EvoTOF tofFront(I2C1);
 EvoTOF tofLeft(I2C2);
 EvoTOF tofRight(I2C3);
 
-// --- Motor ---
-EvoMotor motor(M1, EV3MediumMotor, true);
 
-// --- Button ---
+
+
+EvoMotor motor(M1, EV3MediumMotor, true);
 EvoTriButton triButton(GPIO1);
 
-// --- RGB sensor ---
-EvoRGBColorSensor colorSensor(I2C6);
 
-// --- HuskyLens ---
-EvoHuskyLens husky(I2C7);
 
-// =====================================================================
-// TUNABLE CONSTANTS -- calibrate these on your actual robot/track
-// =====================================================================
 
-// Motor / steering
-const int   FORWARD_SPEED   = -3000;   // matches your original motor.run() value
-const int   SERVO_CENTER    = 95;      // straight-ahead servo position
-const int   TURN_SERVO_OFFSET = 35;    // how far the servo swings for a turn
-const int   STEER_MAX_OFFSET  = 25;    // clamp for proportional correction
+// ============================================================
+// WHEEL KINEMATICS SETUP (MM)
+// ============================================================
 
-// Heading drift correction ("Current heading different from original heading?")
-const float HEADING_THRESHOLD_DEG = 3.0;   // deadband before correcting
-const float STEER_KP              = 1.2;   // servo-degrees per heading-degree error
 
-// Wall detection ("Right/Left ToF sensor sense wall?")
-const int   WALL_DETECT_DISTANCE_MM = 250; // below this = wall present
 
-// Turn execution ("Whenever turn, Always Turn Right/Left" and wall-opening turns)
-const float TURN_ANGLE_DEG = 90.0;   // how far to swing the heading during a turn
 
-// Color classification thresholds -- READ Serial Monitor over your actual
-// orange/blue markers and adjust these before competition.
-const int ORANGE_R_MIN = 150;
-const int ORANGE_B_MAX = 90;
-const int BLUE_B_MIN   = 150;
-const int BLUE_R_MAX   = 90;
+const float WHEEL_DIAMETER_MM = 56.0;
+const float WHEEL_CIRCUMFERENCE_MM = 3.14159265 * WHEEL_DIAMETER_MM;
+const float DEGREES_PER_MM = 360.0 / WHEEL_CIRCUMFERENCE_MM;
 
-// HuskyLens object-stop feature (kept from your original code, not part of
-// the flowchart itself, but left in as a safety/stop trigger)
-const int STOP_ID     = 2;
-const int MIN_WIDTH   = 25;
-const int MIN_HEIGHT  = 35;
 
-// Direction codes
-enum Direction { DIR_NONE = 0, DIR_LEFT = -1, DIR_RIGHT = 1 };
-enum ColorSeen { COLOR_NONE = 0, COLOR_ORANGE = 1, COLOR_BLUE = 2 };
 
-// =====================================================================
-// STATE
-// =====================================================================
 
-float heading0 = 0;                 // "Store Current Heading"
-int   lockedDirection = DIR_NONE;   // "Save Direction" (set once orange/blue seen)
+// ============================================================
+// SENSOR READINGS
+// ============================================================
 
-int distFront, distLeft, distRight;
-int red, green, blue;
 
-// =====================================================================
-// HELPERS
-// =====================================================================
 
-// Wrap an angle difference into the range [-180, 180]
-float normalizeAngle(float angleDeg)
+
+int distFront = 0;
+int distLeft = 0;
+int distRight = 0;
+float gyroRelativeHeading;
+
+
+
+
+// ============================================================
+// PID / GYRO CONTROL SETTINGS
+// ============================================================
+
+
+
+
+// 1. Normal Wall Tracking PID (tuned a bit stronger for correction)
+float kp_straight = 1.7;
+float ki_straight = 0.01;
+float kd_straight = 8;
+
+
+
+
+// 2. Wall Turn PID
+float kp_turn = 1.4;
+float ki_turn = 0.0;
+float kd_turn = 0.00;
+
+
+
+
+// 3. Post-Dodge Realign PID
+// Used ONLY when recovering heading after a color dodge.
+// Lower kd than kp_straight to stop the left-right shake caused
+// by the derivative term reacting to the large initial heading
+// error right after the dodge maneuver. kp is also slightly
+// softened so the correction doesn't overshoot and oscillate.
+float kp_dodge = 1.1;
+float ki_dodge = 0.0;
+float kd_dodge = 2.5;
+
+
+
+
+float integralError = 0.0;
+const float MAX_INTEGRAL = 20.0;
+
+
+
+
+float final = 95.0;
+const float minimumFinal = 0.0;
+float correction = 0;
+
+
+
+
+const float HEADING_TARGET = 0;
+
+
+
+
+// Flag to reset PID internal state between modes
+bool resetPIDNextCall = false;
+
+
+
+
+// ============================================================
+// MOVEMENT CONSTANTS
+// ============================================================
+
+
+
+
+const int DRIVE_SPEED = -4200; //4200
+const int TURN_SPEED = -4300; //4300
+
+
+
+
+// ============================================================
+// SERVO SETTINGS (named, matches existing clamp values below)
+// ============================================================
+
+
+
+
+const int SERVO_STRAIGHT  = 95;
+const int SERVO_MAX_RIGHT = 120;
+const int SERVO_MAX_LEFT  = 50;
+
+
+
+
+// ============================================================
+// WALL TURNING SETTINGS
+// ============================================================
+
+
+
+
+const int WALL_THRESHOLD_MM = 700;
+const int LENIENCY = 8;
+int wallDetectionCount = 0;
+
+
+
+
+// Increased tolerance to prevent endless hunting around target
+const int HEADING_TOLERANCE = 4;
+
+
+
+
+const unsigned long STOP_DURATION_MS = 0;
+const unsigned long FORWARD_DURATION_MS = 1000;
+
+
+
+
+// ============================================================
+// WALL TURNING STATE
+// ============================================================
+
+
+
+
+bool driving = false;
+bool turning = false;
+bool stoppingAfterTurn = false;
+bool drivingAfterTurn = false;
+bool decidingDirection = false;
+
+
+
+
+unsigned long stopStartTime = 0;
+unsigned long forwardStartTime = 0;
+
+
+
+
+float currentHeadingTarget = 0;
+
+
+
+
+// ============================================================
+// FIRST WALL TURN DIRECTION & TURN COUNTING
+// ============================================================
+
+
+
+
+bool firstTurnDecided = false;
+bool turnDirectionLeft = true;
+int totalTurnsCount = 0; // Tracks total completed turns
+
+
+
+
+// ============================================================
+// DIRECTION SAMPLING
+// ============================================================
+
+
+
+
+const int DIRECTION_SAMPLES = 10;
+const int DIRECTION_THRESHOLD = 8000;
+const int DIRECTION_MIN_COUNT = 2;
+
+
+
+
+int directionSampleIndex = 0;
+int leftAboveCount = 0;
+int rightAboveCount = 0;
+
+
+
+
+// ============================================================
+// MAIXCAM UART
+// ============================================================
+
+
+
+
+#define PILLAR_UART_RX_PIN 18
+#define PILLAR_UART_TX_PIN 17
+#define PILLAR_UART_BAUD   115200
+
+
+
+
+HardwareSerial pillarSerial(2);
+
+
+
+
+// ============================================================
+// MAIXCAM CENTER DETECTION
+// ============================================================
+
+
+
+
+// MaixCAM is 320 pixels wide
+const int CAMERA_CENTER_X = 160;
+
+
+
+
+// Object must be within ±30 pixels of center
+const int CENTER_TOLERANCE = 30;
+
+
+
+
+const int CENTER_MIN_X = CAMERA_CENTER_X - CENTER_TOLERANCE;
+const int CENTER_MAX_X = CAMERA_CENTER_X + CENTER_TOLERANCE;
+
+
+
+
+// Color dodge duration
+const unsigned long COLOR_TURN_TIME = 400;
+
+
+
+
+// ============================================================
+// COLOR DATA
+// ============================================================
+
+
+
+
+char pillarColor = 'N';
+
+
+
+
+int pillarX = 0;
+int pillarWidth = 0;
+
+
+
+
+unsigned long pillarLastUpdateMs = 0;
+
+
+
+
+const unsigned long PILLAR_STALE_MS = 500;
+
+
+
+
+// N = nothing
+// R = red
+// G = green
+char detectedTurnColor = 'N';
+
+
+
+
+// ============================================================
+// UART BUFFER
+// ============================================================
+
+
+
+
+#define PILLAR_LINE_BUF_SIZE 32
+
+
+
+
+char pillarLineBuf[PILLAR_LINE_BUF_SIZE];
+uint8_t pillarLineLen = 0;
+
+
+
+
+// ============================================================
+// HELPERS & PID FUNCTIONS
+// ============================================================
+
+
+
+
+float angleDiff(float a, float b)
 {
-    while (angleDeg > 180)  angleDeg -= 360;
-    while (angleDeg < -180) angleDeg += 360;
-    return angleDeg;
+ float diff = b - a;
+ while (diff > 180)  diff -= 360;
+ while (diff < -180) diff += 360;
+ return diff;
 }
 
-void readSensors()
-{
-    distFront = tofFront.getDistance() - 45;
-    distLeft  = tofLeft.getDistance()  - 62;
-    distRight = tofRight.getDistance() - 68;
 
-    red   = colorSensor.getRed();
-    green = colorSensor.getGreen();
-    blue  = colorSensor.getBlue();
+
+
+// Helper function to keep headings within [-180, 180] degrees
+float normalizeHeading(float heading)
+{
+ while (heading > 180.0)  heading -= 360.0;
+ while (heading < -180.0) heading += 360.0;
+ return heading;
 }
 
-// "Detect Orange or Blue?"
-int classifyColor(int r, int g, int b)
+
+
+
+void gyroStraight(float currentHeading, float targetHeading, int speed,
+               float currentKp, float currentKi, float currentKd)
 {
-    if (r > ORANGE_R_MIN && b < ORANGE_B_MAX) return COLOR_ORANGE;
-    if (b > BLUE_B_MIN   && r < BLUE_R_MAX)   return COLOR_BLUE;
-    return COLOR_NONE;
+ static int perror = 0;
+
+
+
+
+ // Reset PID internal state when requested (e.g., after a turn)
+ if (resetPIDNextCall) {
+   perror = 0;
+   integralError = 0;
+   resetPIDNextCall = false;
+ }
+
+
+
+
+ int error = angleDiff(currentHeading, targetHeading);
+
+
+
+
+ int p = error * currentKp;
+
+
+
+
+ integralError += error;
+ if (integralError > MAX_INTEGRAL) integralError = MAX_INTEGRAL;
+ if (integralError < -MAX_INTEGRAL) integralError = -MAX_INTEGRAL;
+ float i = integralError * currentKi;
+
+
+
+
+ int d = (error - perror) * currentKd;
+
+
+
+
+ correction = p + i + d;
+ perror = error;
+
+
+
+
+ // Optional deadband / minimum correction
+ if (correction > 0 && correction < minimumFinal) {
+   correction = minimumFinal;
+ } else if (correction < 0 && correction > -minimumFinal) {
+   correction = -minimumFinal;
+ }
+
+
+
+
+ final = 95 + correction;
+
+
+
+
+ // Clamp servo command
+ if (final < 50) final = 50;
+ if (final > 120) final = 120;
+
+
+
+
+ steering.write(final);
+ motor.run(speed);
 }
 
-// Checks HuskyLens for the stop object (ID 2). Returns true if the robot
-// should stop permanently. This is outside the flowchart's turning logic.
-bool checkStopObject()
+
+
+
+// ============================================================
+// MAIXCAM COLOR DETECTION
+// ============================================================
+//
+// The function reads all available camera packets.
+//
+// A color is ONLY accepted if:
+//
+//   RED/GREEN
+//       AND
+//   X is between CENTER_MIN_X and CENTER_MAX_X
+//
+// The first valid centered color is latched.
+// ============================================================
+
+
+
+
+void updateColorDetection()
 {
-    HUSKYLENSResult result;
+ while (pillarSerial.available() > 0)
+ {
+   char c = pillarSerial.read();
 
-    if (husky.requestBlocks(result))
-    {
-        Serial.print("ID=");
-        Serial.print(result.ID);
-        Serial.print(" W=");
-        Serial.print(result.width);
-        Serial.print(" H=");
-        Serial.println(result.height);
 
-        if (result.ID == STOP_ID &&
-            result.width  >= MIN_WIDTH &&
-            result.height >= MIN_HEIGHT)
-        {
-            return true;
-        }
-    }
-    return false;
+
+
+   // ========================================================
+   // END OF PACKET
+   // ========================================================
+
+
+
+
+   if (c == '\n')
+   {
+     pillarLineBuf[pillarLineLen] = '\0';
+
+
+
+
+     // ------------------------------------------------------
+     // Check packet start
+     // ------------------------------------------------------
+
+
+
+
+     if (pillarLineBuf[0] == '$')
+     {
+       const char *starPos = strchr(pillarLineBuf, '*');
+
+
+
+
+       if (starPos != nullptr)
+       {
+         int payloadLen = starPos - (pillarLineBuf + 1);
+
+
+
+
+         if (payloadLen > 0 && payloadLen < PILLAR_LINE_BUF_SIZE)
+         {
+           char payload[PILLAR_LINE_BUF_SIZE];
+
+
+
+
+           memcpy(payload, pillarLineBuf + 1, payloadLen);
+           payload[payloadLen] = '\0';
+
+
+
+
+           // =================================================
+           // CHECKSUM
+           // =================================================
+
+
+
+
+           unsigned int sum = 0;
+
+
+
+
+           for (int i = 0; i < payloadLen; i++)
+           {
+             sum += (unsigned char) payload[i];
+           }
+
+
+
+
+           sum = sum % 255;
+
+
+
+
+           char expectedChecksum[3];
+
+
+
+
+           snprintf(expectedChecksum, sizeof(expectedChecksum), "%02X", sum);
+
+
+
+
+           const char *receivedChecksum = starPos + 1;
+
+
+
+
+           // =================================================
+           // VERIFY CHECKSUM
+           // =================================================
+
+
+
+
+           if (strncmp(expectedChecksum, receivedChecksum, 2) == 0)
+           {
+             char nColor;
+             int nX;
+             int nW;
+
+
+
+
+             int parsed = sscanf(payload, "%c,%d,%d", &nColor, &nX, &nW);
+
+
+
+
+             // =================================================
+             // VALID RED/GREEN
+             // =================================================
+
+
+
+
+             if (parsed >= 3 && (nColor == 'R' || nColor == 'G'))
+             {
+               pillarColor = nColor;
+               pillarX = nX;
+               pillarWidth = nW;
+               pillarLastUpdateMs = millis();
+
+
+
+
+               // =================================================
+               // CENTER CHECK
+               // =================================================
+               //
+               // Only trigger when the block is in the
+               // center of the camera.
+               // =================================================
+
+
+
+
+               if (nX >= CENTER_MIN_X && nX <= CENTER_MAX_X)
+               {
+                 // Only latch the first centered block
+                 if (detectedTurnColor == 'N')
+                 {
+                   detectedTurnColor = nColor;
+                 }
+               }
+             }
+           }
+         }
+       }
+     }
+
+
+
+
+     // Reset buffer
+     pillarLineLen = 0;
+   }
+
+
+
+
+   // ========================================================
+   // IGNORE \r
+   // ========================================================
+
+
+
+
+   else if (c != '\r')
+   {
+     if (pillarLineLen < PILLAR_LINE_BUF_SIZE - 1)
+     {
+       pillarLineBuf[pillarLineLen++] = c;
+     }
+     else
+     {
+       pillarLineLen = 0;
+     }
+   }
+ }
 }
 
-// "Whenever turn, Always Turn Right / Always Turn Left" and the
-// wall-opening turn both execute a turn maneuver like this: swing the
-// servo toward `dir` and keep driving forward until the gyro shows the
-// heading has rotated by TURN_ANGLE_DEG, then re-center the servo.
-void executeTurn(int dir)
+
+
+
+// ============================================================
+// COLOR DODGE
+// ============================================================
+//
+// Red   -> right COLOR_TURN_TIME ms
+// Green -> left  COLOR_TURN_TIME ms
+//
+// After the dodge, the robot realigns to whatever heading
+// it was already tracking (currentHeadingTarget) using a
+// dedicated, softer PID (kp_dodge/ki_dodge/kd_dodge) to
+// avoid the left-right shake caused by using the normal
+// wall-tracking gains on a large initial heading error.
+// It then hands control back to the normal wall-following
+// state machine.
+// ============================================================
+
+
+
+
+void dodgeColor(char color)
 {
-    float startHeading = gyro.getHeading();
-    int servoAngle = (dir == DIR_RIGHT)
-                        ? (SERVO_CENTER + TURN_SERVO_OFFSET)
-                        : (SERVO_CENTER - TURN_SERVO_OFFSET);
+ // ----------------------------------------------------------
+ // Stop immediately
+ // ----------------------------------------------------------
 
-    steering.write(servoAngle);
 
-    while (true)
-    {
-        motor.run(FORWARD_SPEED);
 
-        float diff = normalizeAngle(gyro.getHeading() - startHeading);
 
-        if (dir == DIR_RIGHT && diff >=  TURN_ANGLE_DEG) break;
-        if (dir == DIR_LEFT  && diff <= -TURN_ANGLE_DEG) break;
+ motor.stop();
 
-        delay(10);
-    }
 
-    steering.write(SERVO_CENTER);
+
+
+ // ----------------------------------------------------------
+ // Display color
+ // ----------------------------------------------------------
+
+
+
+
+ evo.clearDisplay();
+
+
+
+
+ if (color == 'R')
+ {
+   evo.writeToDisplay("RED", 0, 0, true, false);
+ }
+ else if (color == 'G')
+ {
+   evo.writeToDisplay("GREEN", 0, 0, true, false);
+ }
+
+
+
+
+ evo.drawDisplay();
+
+
+
+
+ // ----------------------------------------------------------
+ // Select dodge direction
+ // ----------------------------------------------------------
+
+
+
+
+ if (color == 'R')
+ {
+   // RED = RIGHT
+   steering.write(SERVO_MAX_RIGHT);
+ }
+ else
+ {
+   // GREEN = LEFT
+   steering.write(SERVO_MAX_LEFT);
+ }
+
+
+
+
+ // ----------------------------------------------------------
+ // Drive around block for COLOR_TURN_TIME ms
+ // ----------------------------------------------------------
+
+
+
+
+ unsigned long turnStart = millis();
+
+
+
+
+ while (millis() - turnStart < COLOR_TURN_TIME)
+ {
+   motor.run(DRIVE_SPEED);
+ }
+
+
+
+
+ motor.stop();
+
+
+
+
+ // ----------------------------------------------------------
+ // Reset PID before realigning
+ // ----------------------------------------------------------
+
+
+
+
+ integralError = 0;
+ resetPIDNextCall = true;
+
+
+
+
+ // ----------------------------------------------------------
+ // Gyro-align back to the heading we were already tracking,
+ // using the dedicated post-dodge gains.
+ // ----------------------------------------------------------
+
+
+
+
+ const unsigned long ALIGN_TIMEOUT = 2500;
+
+
+
+
+ unsigned long alignStart = millis();
+
+
+
+
+ while (true)
+ {
+   float heading = gyro.getRelativeHeading();
+
+
+
+
+   float error = angleDiff(heading, currentHeadingTarget);
+
+
+
+
+   // --------------------------------------------------------
+   // Correct heading reached
+   // --------------------------------------------------------
+
+
+
+
+   if (abs(error) <= HEADING_TOLERANCE)
+   {
+     break;
+   }
+
+
+
+
+   // --------------------------------------------------------
+   // Safety timeout
+   // --------------------------------------------------------
+
+
+
+
+   if (millis() - alignStart >= ALIGN_TIMEOUT)
+   {
+     break;
+   }
+
+
+
+
+   // --------------------------------------------------------
+   // GYRO STRAIGHT FORWARD (post-dodge gains)
+   // --------------------------------------------------------
+
+
+
+
+   gyroStraight(heading, currentHeadingTarget, DRIVE_SPEED,
+                kp_dodge, ki_dodge, kd_dodge);
+ }
+
+
+
+
+ motor.stop();
+
+
+
+
+ steering.write(SERVO_STRAIGHT);
 }
 
-// "Steer proportionally to (current heading - original heading) value"
-void steerProportional(float headingDiff)
-{
-    int offset = (int)(STEER_KP * headingDiff);
-    offset = constrain(offset, -STEER_MAX_OFFSET, STEER_MAX_OFFSET);
-    steering.write(SERVO_CENTER + offset);
-}
 
-void showStatus(const char* line1, const char* line2)
-{
-    evo.clearDisplay();
 
-    evo.writeToDisplay(line1, 0, 0, true, false);
-    evo.writeToDisplay(line2, 0, 16);
 
-    evo.writeToDisplay("L:", 0, 32);
-    evo.writeToDisplay(distLeft, 16, 32);
-    evo.writeToDisplay("R:", 45, 32);
-    evo.writeToDisplay(distRight, 61, 32);
-    evo.writeToDisplay("F:", 90, 32);
-    evo.writeToDisplay(distFront, 106, 32);
-
-    evo.writeToDisplay("Dir:", 0, 48);
-    evo.writeToDisplay(lockedDirection == DIR_RIGHT ? "R" :
-                        lockedDirection == DIR_LEFT  ? "L" : "-", 30, 48);
-
-    evo.drawDisplay();
-}
-
-// =====================================================================
+// ============================================================
 // SETUP
-// =====================================================================
+// ============================================================
+
+
+
 
 void setup()
 {
-    Serial.begin(115200);
+ evo.begin();
+ gyro.begin();
 
-    evo.begin();
-    gyro.begin();
 
-    tofFront.begin();
-    tofFront.setLongRange(true);
-    tofLeft.begin();
-    tofLeft.setLongRange(true);
-    tofRight.begin();
-    tofRight.setLongRange(true);
 
-    motor.begin();
 
-    steering.setPeriodHertz(50);
-    steering.attach(GPIO8, 1000, 2000);
-    steering.write(SERVO_CENTER);
+ tofFront.begin();
+ tofFront.setLongRange(true);
 
-    colorSensor.begin();
 
-    if (!husky.begin())
-    {
-        evo.clearDisplay();
-        evo.writeToDisplay("HUSKY ERROR", 0, 0, true, false);
-        evo.writeToDisplay("CHECK I2C7", 0, 16);
-        evo.drawDisplay();
-        while (true) { delay(1000); }
-    }
-    husky.setMode(ALGORITHM_COLOR_RECOGNITION);
 
-    evo.clearDisplay();
-    evo.writeToDisplay("READY", 0, 0, true, false);
-    evo.writeToDisplay("PRESS BUTTON", 0, 16);
-    evo.drawDisplay();
 
-    triButton.waitForBump(3);
+ tofLeft.begin();
+ tofLeft.setLongRange(true);
 
-    gyro.resetHeading();
-    delay(200);
 
-    // "Store Current Heading (heading0)" -- initial value before the loop starts
-    heading0 = gyro.getHeading();
+
+
+ tofRight.begin();
+ tofRight.setLongRange(true);
+
+
+
+
+ motor.begin();
+
+
+
+
+ steering.setPeriodHertz(50);
+ steering.attach(GPIO8, 1000, 2000);
+
+
+
+
+ // ==========================================================
+ // MAIXCAM UART
+ // ==========================================================
+
+
+
+
+ pillarSerial.begin(PILLAR_UART_BAUD, SERIAL_8N1,
+                     PILLAR_UART_RX_PIN, PILLAR_UART_TX_PIN);
+
+
+
+
+ evo.writeToDisplay("No Obstacle OS", 0, 0, true, false);
+ evo.writeToDisplay("Battery:", 0, 8);
+ evo.writeToDisplay(evo.getBattery(), 60, 8, false, true);
+ evo.writeToDisplay("Press button", 0, 16, false, true);
+
+
+
+
+ steering.write(95);
+ delay(300);
+
+
+
+
+ triButton.waitForBump(3);
+
+
+
+
+ gyro.resetHeading();
+ delay(50);
+
+
+
+
+ currentHeadingTarget = 0;
+ wallDetectionCount = 0;
+ firstTurnDecided = false;
+ totalTurnsCount = 0;
+
+
+
+
+ directionSampleIndex = 0;
+ leftAboveCount = 0;
+ rightAboveCount = 0;
+
+
+
+
+ detectedTurnColor = 'N';
+
+
+
+
+ // Start in driving mode with clean PID state
+ driving = true;
+ turning = false;
+ stoppingAfterTurn = false;
+ drivingAfterTurn = false;
+
+
+
+
+ resetPIDNextCall = true;  // Ensure PID starts fresh
 }
 
-// =====================================================================
-// MAIN LOOP  (mirrors the flowchart top-to-bottom, once per call)
-// =====================================================================
+
+
+
+// ============================================================
+// MAIN LOOP
+// ============================================================
+
+
+
 
 void loop()
 {
-    // ---- Safety check (HuskyLens stop object; not part of the flowchart) ----
-    if (checkStopObject())
-    {
-        motor.stop();
-        showStatus("ID 2 FOUND!", "STOPPED");
-        while (true) { delay(1000); }
-    }
+ // Stop entirely if 13 turns have been reached
+ if (totalTurnsCount >= 13)
+ {
+   motor.stop();
+   steering.write(95);
+   return;
+ }
 
-    // ---- "Go Forward" ----
-    motor.run(FORWARD_SPEED);
-    readSensors();
 
-    // ---- "Detect Orange or Blue?" ----
-    int seenColor = classifyColor(red, green, blue);
 
-    if (seenColor == COLOR_ORANGE)
-    {
-        lockedDirection = DIR_RIGHT;        // "Save Direction = Right"
-        executeTurn(DIR_RIGHT);             // "Whenever turn, Always Turn Right"
-        heading0 = gyro.getHeading();       // loop back into "Store Current Heading"
-        showStatus("ORANGE SEEN", "TURN RIGHT");
-        return;
-    }
-    else if (seenColor == COLOR_BLUE)
-    {
-        lockedDirection = DIR_LEFT;         // "Save Direction = Left"
-        executeTurn(DIR_LEFT);              // "Whenever turn, Always Turn Left"
-        heading0 = gyro.getHeading();       // loop back into "Store Current Heading"
-        showStatus("BLUE SEEN", "TURN LEFT");
-        return;
-    }
 
-    // ---- "Current heading different from original heading?" ----
-    float currentHeading = gyro.getHeading();
-    float headingDiff = normalizeAngle(currentHeading - heading0);
+ // Read IMU fast loop
+ gyroRelativeHeading = gyro.getRelativeHeading();
 
-    if (fabs(headingDiff) > HEADING_THRESHOLD_DEG)
-    {
-        steerProportional(headingDiff);
-        heading0 = gyro.getHeading();       // loop back into "Store Current Heading"
-        showStatus("CORRECTING", "HEADING");
-        return;
-    }
 
-    // ---- "Right/Left ToF sensor sense wall?" ----
-    bool leftWallSensed  = (distLeft  < WALL_DETECT_DISTANCE_MM);
-    bool rightWallSensed = (distRight < WALL_DETECT_DISTANCE_MM);
 
-    if (!leftWallSensed || !rightWallSensed)
-    {
-        // "Turn Left/Right, depending on which sensor is not sensing the wall"
-        // If a color direction has already been locked in, honor it;
-        // otherwise turn toward whichever side is open.
-        int dir;
-        if (lockedDirection != DIR_NONE)
-        {
-            dir = lockedDirection;
-        }
-        else
-        {
-            dir = (!leftWallSensed) ? DIR_LEFT : DIR_RIGHT;
-        }
 
-        executeTurn(dir);
-        heading0 = gyro.getHeading();       // loop back into "Store Current Heading"
-        showStatus("WALL OPENING", dir == DIR_RIGHT ? "TURN RIGHT" : "TURN LEFT");
-        return;
-    }
+ // ============================================================
+ // CAMERA: always keep reading incoming packets
+ // ============================================================
 
-    // ---- Both walls sensed: loop back straight to "Go Forward" ----
-    // heading0 intentionally NOT updated here, matching the diagram.
-    steering.write(SERVO_CENTER);
-    showStatus("DRIVING", "STRAIGHT");
+
+
+
+ updateColorDetection();
+
+
+
+
+ // ============================================================
+ // IMMEDIATE COLOR OVERRIDE — HIGHEST PRIORITY, ALWAYS
+ //
+ // Color detection takes priority over everything else in the
+ // state machine, no matter what the robot is currently doing
+ // (driving, turning, sampling directions, stopping after a
+ // turn, etc). If a centered color is seen, it wins — dodge
+ // immediately and cancel whatever state we were in. Wall
+ // logic only runs if no color was detected this loop.
+ // ============================================================
+
+
+
+
+ if (detectedTurnColor == 'R' || detectedTurnColor == 'G')
+ {
+   motor.stop();
+
+
+
+
+   dodgeColor(detectedTurnColor);
+
+
+
+
+   detectedTurnColor = 'N';
+
+
+
+
+   // ----------------------------------------------------------
+   // Cancel whatever state we were in and resume normal
+   // straight-line wall-following on the heading we just
+   // realigned to in dodgeColor().
+   // ----------------------------------------------------------
+
+
+
+
+   driving = true;
+   turning = false;
+   stoppingAfterTurn = false;
+   drivingAfterTurn = false;
+   decidingDirection = false;
+
+
+
+
+   resetPIDNextCall = true;
+   wallDetectionCount = 0;
+
+
+
+
+   return;
+ }
+
+
+
+
+ // ============================================================
+ // WALL TRACKING & TURNING STATE MACHINE
+ // (unchanged — only reached if no color was detected above)
+ // ============================================================
+
+
+
+
+ if (driving)
+ {
+   // Read Front ToF ONLY when in straight driving state
+   distFront = tofFront.getDistance() - 45;
+
+
+
+
+   bool wallDetected = (distFront != -45 && distFront < WALL_THRESHOLD_MM);
+
+
+
+
+   if (wallDetected)
+   {
+     wallDetectionCount++;
+
+
+
+
+     if (wallDetectionCount >= LENIENCY)
+     {
+       wallDetectionCount = 0;
+       motor.stop();
+       driving = false;
+
+
+
+
+       if (!firstTurnDecided)
+       {
+         directionSampleIndex = 0;
+         leftAboveCount = 0;
+         rightAboveCount = 0;
+         decidingDirection = true;
+       }
+       else
+       {
+         if (turnDirectionLeft) currentHeadingTarget -= 90;
+         else currentHeadingTarget += 90;
+
+
+
+
+         currentHeadingTarget = normalizeHeading(currentHeadingTarget);
+
+
+
+
+         integralError = 0;
+         turning = true;
+         totalTurnsCount++; // Increment turn count for subsequent turns
+       }
+     }
+     else
+     {
+       gyroStraight(gyroRelativeHeading, currentHeadingTarget,
+                    DRIVE_SPEED, kp_straight, ki_straight, kd_straight);
+     }
+   }
+   else
+   {
+     wallDetectionCount = 0;
+     gyroStraight(gyroRelativeHeading, currentHeadingTarget,
+                  DRIVE_SPEED, kp_straight, ki_straight, kd_straight);
+   }
+ }
+
+
+
+
+ if (decidingDirection)
+ {
+   // Read Side ToFs ONLY during initial direction sampling
+   distLeft  = tofLeft.getDistance() - 62;
+   distRight = tofRight.getDistance() - 60;
+
+
+
+
+   if (distLeft > DIRECTION_THRESHOLD) leftAboveCount++;
+   if (distRight > DIRECTION_THRESHOLD) rightAboveCount++;
+
+
+
+
+   directionSampleIndex++;
+
+
+
+
+   if (directionSampleIndex >= DIRECTION_SAMPLES)
+   {
+     bool leftQualifies  = (leftAboveCount  > DIRECTION_MIN_COUNT);
+     bool rightQualifies = (rightAboveCount > DIRECTION_MIN_COUNT);
+
+
+
+
+     if (leftQualifies && !rightQualifies) turnDirectionLeft = true;
+     else if (rightQualifies && !leftQualifies) turnDirectionLeft = false;
+     else if (leftAboveCount != rightAboveCount) turnDirectionLeft = (leftAboveCount > rightAboveCount);
+     else turnDirectionLeft = true;
+
+
+
+
+     firstTurnDecided = true;
+     decidingDirection = false;
+
+
+
+
+     if (turnDirectionLeft) currentHeadingTarget -= 90;
+     else currentHeadingTarget += 90;
+
+
+
+
+     currentHeadingTarget = normalizeHeading(currentHeadingTarget);
+
+
+
+
+     integralError = 0;
+     turning = true;
+     totalTurnsCount++; // Increment turn count for the first turn decision
+   }
+ }
+
+
+
+
+ if (turning)
+ {
+   if (abs(angleDiff(gyroRelativeHeading, currentHeadingTarget)) > HEADING_TOLERANCE)
+   {
+     gyroStraight(gyroRelativeHeading, currentHeadingTarget,
+                  TURN_SPEED, kp_turn, ki_turn, kd_turn);
+   }
+   else
+   {
+     turning = false;
+     stopStartTime = millis();
+     stoppingAfterTurn = true;
+   }
+ }
+
+
+
+
+ if (stoppingAfterTurn)
+ {
+   if (millis() - stopStartTime < STOP_DURATION_MS)
+   {
+     motor.stop();
+   }
+   else
+   {
+     stoppingAfterTurn = false;
+     forwardStartTime = millis();
+     drivingAfterTurn = true;
+
+
+
+
+     // Reset PID state before driving straight after a turn
+     resetPIDNextCall = true;
+   }
+ }
+
+
+
+
+ if (drivingAfterTurn)
+ {
+   if (millis() - forwardStartTime < FORWARD_DURATION_MS)
+   {
+     gyroStraight(gyroRelativeHeading, currentHeadingTarget,
+                  DRIVE_SPEED, kp_straight, ki_straight, kd_straight);
+   }
+   else
+   {
+     drivingAfterTurn = false;
+     wallDetectionCount = 0;
+     driving = true;
+   }
+ }
 }
 
