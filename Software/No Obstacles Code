@@ -1,511 +1,462 @@
 #include <Evo.h>
 #include <ESP32Servo.h>
+// non obstacle
 
-// =====================================================================
-// PRELIMINARY ROUND FLOWCHART
-// =====================================================================
-//
-// START
-//   -> Store Current Heading (heading0)
-//   -> Go Forward
-//   -> Detect Orange or Blue?
-//        ORANGE -> Save Direction = Right -> Always Turn Right
-//        BLUE   -> Save Direction = Left  -> Always Turn Left
-//        NO     -> Is Current Heading Different From Original?
-//                  YES -> Steer Proportionally
-//                  NO  -> Do Left/Right ToF Sensors Detect Wall?
-//                         NO  -> Turn Toward the Open Side
-//                               (or Locked Color Direction)
-//                         YES -> Continue Forward
-//
-// Every TURN or STEERING CORRECTION updates heading0 before the next
-// loop, returning to "Store Current Heading" in the flowchart.
-//
-// If both side sensors detect walls, the robot continues forward
-// without updating heading0.
-// =====================================================================
+
+// ============================================================
+// HARDWARE OBJECTS
+// ============================================================
+
 
 EVOX1 evo;
-
-// --- IMU ---
 EvoIMU gyro(I2C8);
-
-// --- Servo ---
 Servo steering;
 
-// --- ToF Sensors ---
+
 EvoTOF tofFront(I2C1);
 EvoTOF tofLeft(I2C2);
 EvoTOF tofRight(I2C3);
 
-// --- Motor ---
-EvoMotor motor(M1, EV3MediumMotor, true);
 
-// --- Button ---
+EvoMotor motor(M1, EV3MediumMotor, true);
 EvoTriButton triButton(GPIO1);
 
-// --- RGB Color Sensor ---
-EvoRGBColorSensor colorSensor(I2C6);
 
-// --- HuskyLens ---
-EvoHuskyLens husky(I2C7);
+// ============================================================
+// WHEEL KINEMATICS SETUP (MM)
+// ============================================================
 
-// =====================================================================
-// TUNABLE CONSTANTS
-// =====================================================================
 
-// Motor / Steering
-const int FORWARD_SPEED     = -3000;  // Forward motor speed
-const int SERVO_CENTER      = 95;     // Straight-ahead servo position
-const int TURN_SERVO_OFFSET = 35;     // Servo offset used during turns
-const int STEER_MAX_OFFSET  = 25;     // Maximum steering correction
+const float WHEEL_DIAMETER_MM = 56.0;
+const float WHEEL_CIRCUMFERENCE_MM = 3.14159265 * WHEEL_DIAMETER_MM;
+const float DEGREES_PER_MM = 360.0 / WHEEL_CIRCUMFERENCE_MM;
 
-// Heading Correction
-const float HEADING_THRESHOLD_DEG = 3.0;  // Heading error deadband
-const float STEER_KP              = 1.2;  // Steering correction strength
 
-// Wall Detection
-const int WALL_DETECT_DISTANCE_MM = 250;  // Below this = wall detected
+// ============================================================
+// SENSOR READINGS
+// ============================================================
 
-// Turn Execution
-const float TURN_ANGLE_DEG = 90.0;  // Target angle for each turn
 
-// Color Detection
-// Adjust these values using the Serial Monitor with your actual markers.
-const int ORANGE_R_MIN = 150;
-const int ORANGE_B_MAX = 90;
+int distFront = 0;
+int distLeft = 0;
+int distRight = 0;
+float gyroRelativeHeading;
 
-const int BLUE_B_MIN = 150;
-const int BLUE_R_MAX = 90;
 
-// HuskyLens Stop Object
-// Stops the robot when ID 2 is detected at the required size.
-const int STOP_ID    = 2;
-const int MIN_WIDTH  = 25;
-const int MIN_HEIGHT = 35;
+// ============================================================
+// PID / GYRO CONTROL SETTINGS
+// ============================================================
 
-// =====================================================================
-// DIRECTION / COLOR CODES
-// =====================================================================
 
-enum Direction
+// 1. Normal Wall Tracking PID
+float kp_straight = 1.5;
+float ki_straight = 0.01;
+float kd_straight = 11;
+
+
+// 2. Wall Turn PID
+float kp_turn = 1.3;
+float ki_turn = 0.0;
+float kd_turn = 0.00;
+
+
+float integralError = 0.0;
+const float MAX_INTEGRAL = 20.0;
+
+
+float final = 95.0;
+const float minimumFinal = 0.0;
+float correction = 0;
+
+
+const float HEADING_TARGET = 0;
+
+
+// ============================================================
+// MOVEMENT CONSTANTS
+// ============================================================
+
+
+const int DRIVE_SPEED = -4000;
+const int TURN_SPEED = -4000;
+
+
+// ============================================================
+// WALL TURNING SETTINGS
+// ============================================================
+
+
+const int WALL_THRESHOLD_MM = 650;
+const int LENIENCY = 3;
+int wallDetectionCount = 0;
+
+
+// Increased tolerance to prevent endless hunting around target
+const int HEADING_TOLERANCE = 4;
+
+
+const unsigned long STOP_DURATION_MS = 0;
+const unsigned long FORWARD_DURATION_MS = 1000;
+
+
+// ============================================================
+// WALL TURNING STATE
+// ============================================================
+
+
+bool driving = false;
+bool turning = false;
+bool stoppingAfterTurn = false;
+bool drivingAfterTurn = false;
+bool decidingDirection = false;
+
+
+unsigned long stopStartTime = 0;
+unsigned long forwardStartTime = 0;
+
+
+float currentHeadingTarget = 0;
+
+
+// ============================================================
+// FIRST WALL TURN DIRECTION
+// ============================================================
+
+
+bool firstTurnDecided = false;
+bool turnDirectionLeft = true;
+
+
+// ============================================================
+// DIRECTION SAMPLING
+// ============================================================
+
+
+const int DIRECTION_SAMPLES = 10;
+const int DIRECTION_THRESHOLD = 8000;
+const int DIRECTION_MIN_COUNT = 2;
+
+
+int directionSampleIndex = 0;
+int leftAboveCount = 0;
+int rightAboveCount = 0;
+
+
+// ============================================================
+// HELPERS & PID FUNCTIONS
+// ============================================================
+
+
+float angleDiff(float a, float b)
 {
-    DIR_NONE  = 0,
-    DIR_LEFT  = -1,
-    DIR_RIGHT = 1
-};
-
-enum ColorSeen
-{
-    COLOR_NONE   = 0,
-    COLOR_ORANGE = 1,
-    COLOR_BLUE   = 2
-};
-
-// =====================================================================
-// STATE
-// =====================================================================
-
-float heading0 = 0;               // Stored reference heading
-int lockedDirection = DIR_NONE;   // Direction locked by orange/blue marker
-
-int distFront;
-int distLeft;
-int distRight;
-
-int red;
-int green;
-int blue;
-
-// =====================================================================
-// HELPER FUNCTIONS
-// =====================================================================
-
-// Keeps an angle difference within the range -180 to +180 degrees.
-float normalizeAngle(float angleDeg)
-{
-    while (angleDeg > 180)
-        angleDeg -= 360;
-
-    while (angleDeg < -180)
-        angleDeg += 360;
-
-    return angleDeg;
+ float diff = b - a;
+ while (diff > 180)  diff -= 360;
+ while (diff < -180) diff += 360;
+ return diff;
 }
 
-// Reads the ToF and RGB sensors.
-void readSensors()
-{
-    distFront = tofFront.getDistance() - 45;
-    distLeft  = tofLeft.getDistance() - 62;
-    distRight = tofRight.getDistance() - 68;
 
-    red   = colorSensor.getRed();
-    green = colorSensor.getGreen();
-    blue  = colorSensor.getBlue();
+// Helper function to keep headings within [-180, 180] degrees
+float normalizeHeading(float heading)
+{
+ while (heading > 180.0)  heading -= 360.0;
+ while (heading < -180.0) heading += 360.0;
+ return heading;
 }
 
-// Detects whether the RGB sensor sees an orange or blue marker.
-int classifyColor(int r, int g, int b)
+
+void gyroStraight(float currentHeading, float targetHeading, int speed, float currentKp, float currentKi, float currentKd)
 {
-    if (r > ORANGE_R_MIN && b < ORANGE_B_MAX)
-        return COLOR_ORANGE;
+ static int perror = 0;
+ int error = angleDiff(currentHeading, targetHeading);
 
-    if (b > BLUE_B_MIN && r < BLUE_R_MAX)
-        return COLOR_BLUE;
 
-    return COLOR_NONE;
+ int p = error * currentKp;
+
+
+ integralError += error;
+ if (integralError > MAX_INTEGRAL) integralError = MAX_INTEGRAL;
+ if (integralError < -MAX_INTEGRAL) integralError = -MAX_INTEGRAL;
+ float i = integralError * currentKi;
+
+
+ int d = (error - perror) * currentKd;
+
+
+ correction = p + i + d;
+ perror = error;
+
+
+ if (correction > 0 && correction < minimumFinal) {
+   correction = minimumFinal;
+ } else if (correction < 0 && correction > -minimumFinal) {
+   correction = -minimumFinal;
+ }
+
+
+ final = 95 + correction;
+
+
+ if (final < 50) final = 50;
+ if (final > 120) final = 120;
+
+
+ steering.write(final);
+ motor.run(speed);
 }
 
-// Checks HuskyLens for the ID-2 stop object.
-// Returns true when the robot should stop permanently.
-bool checkStopObject()
-{
-    HUSKYLENSResult result;
 
-    if (husky.requestBlocks(result))
-    {
-        Serial.print("ID=");
-        Serial.print(result.ID);
-
-        Serial.print(" W=");
-        Serial.print(result.width);
-
-        Serial.print(" H=");
-        Serial.println(result.height);
-
-        if (result.ID == STOP_ID &&
-            result.width >= MIN_WIDTH &&
-            result.height >= MIN_HEIGHT)
-        {
-            return true;
-        }
-    }
-
-    return false;
-}
-
-// Performs a turn in the selected direction.
-// The robot keeps moving forward until the gyro detects the target
-// turning angle, then the steering returns to the center.
-void executeTurn(int dir)
-{
-    float startHeading = gyro.getHeading();
-
-    int servoAngle =
-        (dir == DIR_RIGHT)
-            ? (SERVO_CENTER + TURN_SERVO_OFFSET)
-            : (SERVO_CENTER - TURN_SERVO_OFFSET);
-
-    steering.write(servoAngle);
-
-    while (true)
-    {
-        motor.run(FORWARD_SPEED);
-
-        float diff =
-            normalizeAngle(gyro.getHeading() - startHeading);
-
-        if (dir == DIR_RIGHT && diff >= TURN_ANGLE_DEG)
-            break;
-
-        if (dir == DIR_LEFT && diff <= -TURN_ANGLE_DEG)
-            break;
-
-        delay(10);
-    }
-
-    steering.write(SERVO_CENTER);
-}
-
-// Corrects the robot's heading proportionally to the heading error.
-void steerProportional(float headingDiff)
-{
-    int offset = (int)(STEER_KP * headingDiff);
-
-    offset = constrain(
-        offset,
-        -STEER_MAX_OFFSET,
-        STEER_MAX_OFFSET
-    );
-
-    steering.write(SERVO_CENTER + offset);
-}
-
-// Displays the current robot status and sensor readings.
-void showStatus(const char* line1, const char* line2)
-{
-    evo.clearDisplay();
-
-    evo.writeToDisplay(line1, 0, 0, true, false);
-    evo.writeToDisplay(line2, 0, 16);
-
-    evo.writeToDisplay("L:", 0, 32);
-    evo.writeToDisplay(distLeft, 16, 32);
-
-    evo.writeToDisplay("R:", 45, 32);
-    evo.writeToDisplay(distRight, 61, 32);
-
-    evo.writeToDisplay("F:", 90, 32);
-    evo.writeToDisplay(distFront, 106, 32);
-
-    evo.writeToDisplay("Dir:", 0, 48);
-
-    evo.writeToDisplay(
-        lockedDirection == DIR_RIGHT ? "R" :
-        lockedDirection == DIR_LEFT  ? "L" :
-        "-",
-        30,
-        48
-    );
-
-    evo.drawDisplay();
-}
-
-// =====================================================================
+// ============================================================
 // SETUP
-// =====================================================================
+// ============================================================
+
 
 void setup()
 {
-    Serial.begin(115200);
+ evo.begin();
+ gyro.begin();
 
-    // Start EVO and IMU.
-    evo.begin();
-    gyro.begin();
 
-    // Start and configure ToF sensors.
-    tofFront.begin();
-    tofFront.setLongRange(true);
+ tofFront.begin();
+ tofFront.setLongRange(true);
 
-    tofLeft.begin();
-    tofLeft.setLongRange(true);
 
-    tofRight.begin();
-    tofRight.setLongRange(true);
+ tofLeft.begin();
+ tofLeft.setLongRange(true);
 
-    // Start motor.
-    motor.begin();
 
-    // Configure steering servo.
-    steering.setPeriodHertz(50);
-    steering.attach(GPIO8, 1000, 2000);
-    steering.write(SERVO_CENTER);
+ tofRight.begin();
+ tofRight.setLongRange(true);
 
-    // Start RGB color sensor.
-    colorSensor.begin();
 
-    // Start HuskyLens.
-    if (!husky.begin())
-    {
-        evo.clearDisplay();
+ motor.begin();
 
-        evo.writeToDisplay(
-            "HUSKY ERROR",
-            0,
-            0,
-            true,
-            false
-        );
 
-        evo.writeToDisplay(
-            "CHECK I2C7",
-            0,
-            16
-        );
+ steering.setPeriodHertz(50);
+ steering.attach(GPIO8, 1000, 2000);
 
-        evo.drawDisplay();
 
-        // Stay here if HuskyLens fails to start.
-        while (true)
-        {
-            delay(1000);
-        }
-    }
+ evo.writeToDisplay("No Obstacle OS", 0, 0, true, false);
+ evo.writeToDisplay("Battery:", 0, 8);
+ evo.writeToDisplay(evo.getBattery(), 60, 8, false, true);
+ evo.writeToDisplay("Press button", 0, 16, false, true);
 
-    husky.setMode(ALGORITHM_COLOR_RECOGNITION);
 
-    // Show ready screen.
-    evo.clearDisplay();
+ steering.write(95);
+ delay(300);
 
-    evo.writeToDisplay(
-        "READY",
-        0,
-        0,
-        true,
-        false
-    );
 
-    evo.writeToDisplay(
-        "PRESS BUTTON",
-        0,
-        16
-    );
+ triButton.waitForBump(3);
 
-    evo.drawDisplay();
 
-    // Wait for the start button.
-    triButton.waitForBump(3);
+ gyro.resetHeading();
+ delay(50);
 
-    // Reset and store the initial heading.
-    gyro.resetHeading();
-    delay(200);
 
-    heading0 = gyro.getHeading();
+ currentHeadingTarget = 0;
+ wallDetectionCount = 0;
+ firstTurnDecided = false;
+
+
+ directionSampleIndex = 0;
+ leftAboveCount = 0;
+ rightAboveCount = 0;
+
+
+ driving = true;
+ turning = false;
+ stoppingAfterTurn = false;
+ drivingAfterTurn = false;
 }
 
-// =====================================================================
+
+// ============================================================
 // MAIN LOOP
-// =====================================================================
+// ============================================================
+
 
 void loop()
 {
-    // Check for the HuskyLens stop object.
-    if (checkStopObject())
-    {
-        motor.stop();
+ // Read IMU fast loop
+ gyroRelativeHeading = gyro.getRelativeHeading();
 
-        showStatus(
-            "ID 2 FOUND!",
-            "STOPPED"
-        );
 
-        // Stop permanently.
-        while (true)
-        {
-            delay(1000);
-        }
-    }
+ // ============================================================
+ // WALL TRACKING & TURNING STATE MACHINE
+ // ============================================================
+ if (driving)
+ {
+   // Read Front ToF ONLY when in straight driving state
+   distFront = tofFront.getDistance() - 45;
 
-    // -------------------------------------------------------------
-    // GO FORWARD
-    // -------------------------------------------------------------
 
-    motor.run(FORWARD_SPEED);
-    readSensors();
+   bool wallDetected = (distFront != -45 && distFront < WALL_THRESHOLD_MM);
 
-    // -------------------------------------------------------------
-    // DETECT ORANGE OR BLUE
-    // -------------------------------------------------------------
 
-    int seenColor = classifyColor(
-        red,
-        green,
-        blue
-    );
+   if (wallDetected)
+   {
+     wallDetectionCount++;
 
-    if (seenColor == COLOR_ORANGE)
-    {
-        // Orange locks the robot to right turns.
-        lockedDirection = DIR_RIGHT;
 
-        executeTurn(DIR_RIGHT);
+     if (wallDetectionCount >= LENIENCY)
+     {
+       wallDetectionCount = 0;
+       motor.stop();
+       driving = false;
 
-        heading0 = gyro.getHeading();
 
-        showStatus(
-            "ORANGE SEEN",
-            "TURN RIGHT"
-        );
+       if (!firstTurnDecided)
+       {
+         directionSampleIndex = 0;
+         leftAboveCount = 0;
+         rightAboveCount = 0;
+         decidingDirection = true;
+       }
+       else
+       {
+         if (turnDirectionLeft) currentHeadingTarget -= 90;
+         else currentHeadingTarget += 90;
 
-        return;
-    }
 
-    if (seenColor == COLOR_BLUE)
-    {
-        // Blue locks the robot to left turns.
-        lockedDirection = DIR_LEFT;
+         currentHeadingTarget = normalizeHeading(currentHeadingTarget);
 
-        executeTurn(DIR_LEFT);
 
-        heading0 = gyro.getHeading();
+         integralError = 0;
+         turning = true;
+       }
+     }
+     else
+     {
+       gyroStraight(gyroRelativeHeading, currentHeadingTarget, DRIVE_SPEED, kp_straight, ki_straight, kd_straight);
+     }
+   }
+   else
+   {
+     wallDetectionCount = 0;
+     gyroStraight(gyroRelativeHeading, currentHeadingTarget, DRIVE_SPEED, kp_straight, ki_straight, kd_straight);
+   }
+ }
 
-        showStatus(
-            "BLUE SEEN",
-            "TURN LEFT"
-        );
 
-        return;
-    }
+ if (decidingDirection)
+ {
+   // Read Side ToFs ONLY during initial direction sampling
+   distLeft  = tofLeft.getDistance() - 62;
+   distRight = tofRight.getDistance() - 60;
 
-    // -------------------------------------------------------------
-    // CHECK HEADING
-    // -------------------------------------------------------------
 
-    float currentHeading = gyro.getHeading();
+   if (distLeft > DIRECTION_THRESHOLD) leftAboveCount++;
+   if (distRight > DIRECTION_THRESHOLD) rightAboveCount++;
 
-    float headingDiff =
-        normalizeAngle(currentHeading - heading0);
 
-    if (fabs(headingDiff) > HEADING_THRESHOLD_DEG)
-    {
-        steerProportional(headingDiff);
+   directionSampleIndex++;
 
-        // Store the corrected heading for the next loop.
-        heading0 = gyro.getHeading();
 
-        showStatus(
-            "CORRECTING",
-            "HEADING"
-        );
+   if (directionSampleIndex >= DIRECTION_SAMPLES)
+   {
+     bool leftQualifies  = (leftAboveCount  > DIRECTION_MIN_COUNT);
+     bool rightQualifies = (rightAboveCount > DIRECTION_MIN_COUNT);
 
-        return;
-    }
 
-    // -------------------------------------------------------------
-    // CHECK SIDE WALLS
-    // -------------------------------------------------------------
+     if (leftQualifies && !rightQualifies) turnDirectionLeft = true;
+     else if (rightQualifies && !leftQualifies) turnDirectionLeft = false;
+     else if (leftAboveCount != rightAboveCount) turnDirectionLeft = (leftAboveCount > rightAboveCount);
+     else turnDirectionLeft = true;
 
-    bool leftWallSensed =
-        (distLeft < WALL_DETECT_DISTANCE_MM);
 
-    bool rightWallSensed =
-        (distRight < WALL_DETECT_DISTANCE_MM);
+     firstTurnDecided = true;
+     decidingDirection = false;
 
-    // If either side is open, turn toward the open side.
-    if (!leftWallSensed || !rightWallSensed)
-    {
-        int dir;
 
-        // If orange/blue has already locked a direction,
-        // always use that direction.
-        if (lockedDirection != DIR_NONE)
-        {
-            dir = lockedDirection;
-        }
-        else
-        {
-            // Otherwise, turn toward the side without a wall.
-            dir = (!leftWallSensed)
-                ? DIR_LEFT
-                : DIR_RIGHT;
-        }
+     if (turnDirectionLeft) currentHeadingTarget -= 90;
+     else currentHeadingTarget += 90;
 
-        executeTurn(dir);
 
-        heading0 = gyro.getHeading();
+     currentHeadingTarget = normalizeHeading(currentHeadingTarget);
 
-        showStatus(
-            "WALL OPENING",
-            dir == DIR_RIGHT
-                ? "TURN RIGHT"
-                : "TURN LEFT"
-        );
 
-        return;
-    }
+     integralError = 0;
+     turning = true;
+   }
+ }
 
-    // -------------------------------------------------------------
-    // BOTH SIDES HAVE WALLS
-    // -------------------------------------------------------------
 
-    // Continue driving straight.
-    // heading0 is intentionally left unchanged.
-    steering.write(SERVO_CENTER);
+ if (turning)
+ {
+   if (abs(angleDiff(gyroRelativeHeading, currentHeadingTarget)) > HEADING_TOLERANCE)
+   {
+     gyroStraight(gyroRelativeHeading, currentHeadingTarget, TURN_SPEED, kp_turn, ki_turn, kd_turn);
+   }
+   else
+   {
+     turning = false;
+     stopStartTime = millis();
+     stoppingAfterTurn = true;
+   }
+ }
 
-    showStatus(
-        "DRIVING",
-        "STRAIGHT"
-    );
+
+ if (stoppingAfterTurn)
+ {
+   if (millis() - stopStartTime < STOP_DURATION_MS)
+   {
+     motor.stop();
+   }
+   else
+   {
+     stoppingAfterTurn = false;
+     forwardStartTime = millis();
+     drivingAfterTurn = true;
+   }
+ }
+
+
+ if (drivingAfterTurn)
+ {
+   if (millis() - forwardStartTime < FORWARD_DURATION_MS)
+   {
+     gyroStraight(gyroRelativeHeading, currentHeadingTarget, DRIVE_SPEED, kp_straight, ki_straight, kd_straight);
+   }
+   else
+   {
+     drivingAfterTurn = false;
+     wallDetectionCount = 0;
+     driving = true;
+   }
+ }
+
+
+ // ============================================================
+ // DISPLAY OUTPUT (Disabled for performance)
+ // ============================================================
+ // evo.clearDisplay();
+
+
+ // evo.writeToDisplay("Front:", 0, 0);
+ // evo.writeToDisplay(distFront, 60, 0);
+
+
+ // evo.writeToDisplay("Left:", 0, 8);
+ // evo.writeToDisplay(distLeft, 60, 8);
+
+
+ // evo.writeToDisplay("Right:", 0, 16);
+ // evo.writeToDisplay(distRight, 60, 16);
+
+
+ // evo.writeToDisplay("Heading:", 0, 24);
+ // evo.writeToDisplay(gyroRelativeHeading, 60, 24);
+
+
+ // if (decidingDirection) evo.writeToDisplay("DECIDING", 0, 56);
+ // else if (turning) evo.writeToDisplay("WALL TURN", 0, 56);
+ // else if (stoppingAfterTurn) evo.writeToDisplay("STOP AFTER TURN", 0, 56);
+ // else if (drivingAfterTurn) evo.writeToDisplay("AFTER TURN", 0, 56);
+ // else evo.writeToDisplay("WALL DRIVE", 0, 56);
+
+
+ // evo.drawDisplay();
 }
+
+
 
